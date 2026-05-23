@@ -16,6 +16,6 @@ export default defineConfig({
   },
   preview: {
     host: true,
-    allowedHosts: ['.onrender.com', '.up.railway.app'],
+    allowedHosts: true,
   },
 })
