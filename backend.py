@@ -71,6 +71,17 @@ JOBS_DIR.mkdir(exist_ok=True)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
+# ── CORS Configuration ──
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
+CORS_ORIGINS = [
+    FRONTEND_URL,
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+    "*",  # Allow all origins (can be restricted for production)
+]
+
 JOBS: dict[str, dict] = {}
 
 
@@ -351,21 +362,9 @@ app = FastAPI(
     version="1.0.0",
 )
 
-_default_origins = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-_extra_origins = [
-    o.strip()
-    for o in os.environ.get("CORS_ORIGINS", "").split(",")
-    if o.strip()
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_default_origins + _extra_origins,
-    allow_origin_regex=os.environ.get("CORS_ORIGIN_REGEX") or None,
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

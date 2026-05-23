@@ -20,8 +20,6 @@ services:
         value: meta-llama/Llama-3.3-70B-Instruct-Turbo
       - key: DATABASE_URL
         sync: false
-      - key: CORS_ORIGIN_REGEX
-        value: "https://.*\\.onrender\\.com"
 
   # ─── React/Vite Frontend (Static Site) ─────────────────────────────
   - type: web
