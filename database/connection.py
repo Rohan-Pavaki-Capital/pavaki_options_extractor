@@ -20,11 +20,15 @@ except ImportError:
 
 
 def get_dsn() -> str:
-    dsn = os.environ.get("db_string") or os.environ.get("DB_STRING")
+    dsn = (
+        os.environ.get("db_string")
+        or os.environ.get("DB_STRING")
+        or os.environ.get("DATABASE_URL")
+    )
     if not dsn:
         raise RuntimeError(
-            "db_string not found in environment. "
-            "Add it to .env as: db_string=\"postgresql://...\""
+            "Database connection string not found in environment. "
+            "Set db_string, DB_STRING, or DATABASE_URL."
         )
     return dsn.strip().strip('"').strip("'")
 
