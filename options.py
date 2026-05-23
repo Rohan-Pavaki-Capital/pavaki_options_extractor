@@ -40,6 +40,7 @@ import tempfile
 import glob
 from pathlib import Path
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, "reconfigure"):
@@ -239,28 +240,55 @@ def _find_tables(page) -> list:
     return []
 
 
-def keyword_filter(pdf_path: str) -> tuple[list[int], dict]:
+def _scan_page_chunk(pdf_path: str, page_indices: list[int]) -> dict:
     """
-    Stage 1: Lenient keyword scan over the entire PDF.
+    Worker: open the PDF once and scan a slice of page indices.
+    fitz.Document is not thread-safe, so each worker gets its own handle.
+    """
+    out = {}
+    try:
+        with fitz.open(pdf_path) as doc:
+            for i in page_indices:
+                try:
+                    page = doc.load_page(i)
+                    text = page.get_text() or ""
+                except Exception:
+                    page = None
+                    text = ""
+                out[i + 1] = match_page(i + 1, text, page)
+    except Exception as e:
+        log(f"   ⚠ Chunk scan failed ({page_indices[0]+1}-{page_indices[-1]+1}): {e}")
+        for i in page_indices:
+            if i + 1 not in out:
+                out[i + 1] = PageMatch(page_num=i + 1, text_length=0)
+    return out
+
+
+def keyword_filter(pdf_path: str, workers: int = 4) -> tuple[list[int], dict]:
+    """
+    Stage 1: Lenient keyword scan over the entire PDF (parallelized).
 
     Returns (candidate_pages, matches_by_page) where matches_by_page maps
     page_num -> PageMatch for downstream logging.
     """
-    matches = {}
-    candidates = []
     with fitz.open(pdf_path) as doc:
         total = len(doc)
-        log(f"   Scanning {total} pages...")
-        for i in range(total):
-            page = doc.load_page(i)
-            try:
-                text = page.get_text() or ""
-            except Exception:
-                text = ""
-            pm = match_page(i + 1, text, page)
-            matches[i + 1] = pm
-            if pm.is_candidate:
-                candidates.append(i + 1)
+
+    workers = max(1, min(workers, total))
+    log(f"   Scanning {total} pages ({workers} workers)...")
+
+    chunk_size = max(1, (total + workers - 1) // workers)
+    chunks = [
+        list(range(i, min(i + chunk_size, total)))
+        for i in range(0, total, chunk_size)
+    ]
+
+    matches = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for chunk_result in executor.map(lambda c: _scan_page_chunk(pdf_path, c), chunks):
+            matches.update(chunk_result)
+
+    candidates = [pg for pg in sorted(matches) if matches[pg].is_candidate]
     return candidates, matches
 
 
@@ -301,6 +329,25 @@ def get_page_text(pdf_path: str, page_num: int) -> str:
             except Exception:
                 return ""
     return ""
+
+
+def get_page_texts(pdf_path: str, page_nums: list[int]) -> dict[int, str]:
+    """Batch text extraction — single PDF open, used to prime parallel classifier."""
+    out = {}
+    if not page_nums:
+        return out
+    with fitz.open(pdf_path) as doc:
+        total = len(doc)
+        for pg in page_nums:
+            idx = pg - 1
+            if 0 <= idx < total:
+                try:
+                    out[pg] = doc.load_page(idx).get_text() or ""
+                except Exception:
+                    out[pg] = ""
+            else:
+                out[pg] = ""
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -437,15 +484,16 @@ def detect_relevant_pages(
     skip_llm: bool = False,
     debug: bool = False,
     cost_tracker=None,
+    workers: int = 8,
 ) -> tuple[list[int], dict]:
     """
     Three-stage pipeline:
-      1. Lenient keyword filter → candidates
-      2. LLM classifier → confirmed pages
-      3. Neighbor expansion (LLM-verified) → final set
+      1. Lenient keyword filter → candidates  (parallel page scan)
+      2. LLM classifier → confirmed pages     (parallel API calls)
+      3. Neighbor expansion (LLM-verified) → final set (parallel API calls)
     """
     log("\n🔍 Stage 1: Keyword filter")
-    candidates, matches = keyword_filter(pdf_path)
+    candidates, matches = keyword_filter(pdf_path, workers=max(1, min(workers, 4)))
 
     if debug:
         for pg in candidates:
@@ -483,68 +531,97 @@ def detect_relevant_pages(
             }
         return sorted(candidates), classifications
 
-    log(f"\n🤖 Stage 2: LLM classification ({together_model})")
+    log(f"\n🤖 Stage 2: LLM classification ({together_model}) — {workers} workers")
     log(f"   Classifying {len(candidates)} candidates...")
 
-    confirmed = []
-    consecutive_failures = 0
-    for page_num in candidates:
-        page_text = get_page_text(pdf_path, page_num)
-        result = classify_with_llm(
-            together_client, together_model, page_text, page_num, cost_tracker
-        )
-        classifications[page_num] = result
+    # Single PDF open to fetch all candidate texts up front, then fan out.
+    page_texts = get_page_texts(pdf_path, candidates)
 
-        marker = "✓" if result["keep"] else "✗"
-        decision_label = "KEEP  " if result["keep"] else "REJECT"
-        log(f"   {marker} Page {page_num}: {decision_label} ({result['confidence']}) - {result['reason']}")
+    confirmed_set: set[int] = set()
+    total_failures = 0
 
-        if result["reason"].startswith("classifier-error"):
-            consecutive_failures += 1
-            if consecutive_failures >= 5:
-                log("   ⚠ Too many classifier failures. Falling back to keyword-only.")
-                for pg in candidates:
-                    if pg not in classifications:
-                        classifications[pg] = {
-                            "keep": True, "decision": "KEEP",
-                            "confidence": "N/A", "reason": "classifier-down",
-                        }
-                return sorted(candidates), classifications
-        else:
-            consecutive_failures = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_page = {
+            executor.submit(
+                classify_with_llm,
+                together_client, together_model,
+                page_texts.get(pg, ""), pg, cost_tracker,
+            ): pg
+            for pg in candidates
+        }
+        for future in as_completed(future_to_page):
+            page_num = future_to_page[future]
+            try:
+                result = future.result()
+            except Exception as e:
+                result = {
+                    "keep": True, "decision": "KEEP",
+                    "confidence": "LOW", "reason": f"task-error: {str(e)[:80]}",
+                }
+            classifications[page_num] = result
 
-        if result["keep"]:
-            confirmed.append(page_num)
+            marker = "✓" if result["keep"] else "✗"
+            decision_label = "KEEP  " if result["keep"] else "REJECT"
+            log(f"   {marker} Page {page_num}: {decision_label} ({result['confidence']}) - {result['reason']}")
 
+            if result["reason"].startswith(("classifier-error", "task-error")):
+                total_failures += 1
+            if result["keep"]:
+                confirmed_set.add(page_num)
+
+    if total_failures > 0:
+        log(f"   ⚠ {total_failures} page(s) defaulted to KEEP due to classifier errors")
+
+    confirmed = sorted(confirmed_set)
     log(f"   ✓ {len(confirmed)} pages passed classification")
 
-    # Stage 3: Neighbor expansion for HIGH-confidence confirmed pages
+    # Stage 3: Neighbor expansion for HIGH-confidence confirmed pages (parallel).
     log("\n🔗 Stage 3: Neighbor expansion")
-    expanded = set(confirmed)
     candidate_set = set(candidates)
     high_conf = [pg for pg in confirmed if classifications[pg].get("confidence") == "HIGH"]
 
+    neighbors_to_check = set()
     for page_num in high_conf:
-        for neighbor in [page_num - 1, page_num + 1]:
-            if neighbor in candidate_set and neighbor not in expanded:
-                page_text = get_page_text(pdf_path, neighbor)
-                result = classify_with_llm(
-                    together_client, together_model, page_text, neighbor, cost_tracker
-                )
-                classifications[neighbor] = result
+        for neighbor in (page_num - 1, page_num + 1):
+            if neighbor in candidate_set and neighbor not in confirmed_set:
+                neighbors_to_check.add(neighbor)
+
+    if neighbors_to_check:
+        neighbor_texts = get_page_texts(pdf_path, sorted(neighbors_to_check))
+        added_count = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_neighbor = {
+                executor.submit(
+                    classify_with_llm,
+                    together_client, together_model,
+                    neighbor_texts.get(n, ""), n, cost_tracker,
+                ): n
+                for n in neighbors_to_check
+            }
+            for future in as_completed(future_to_neighbor):
+                n = future_to_neighbor[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    result = {
+                        "keep": True, "decision": "KEEP",
+                        "confidence": "LOW", "reason": f"task-error: {str(e)[:80]}",
+                    }
+                classifications[n] = result
                 marker = "✓" if result["keep"] else "✗"
                 decision_label = "KEEP  " if result["keep"] else "REJECT"
-                log(f"   {marker} Page {neighbor} (neighbor of {page_num}): {decision_label} ({result['confidence']}) - {result['reason']}")
+                log(f"   {marker} Page {n} (neighbor): {decision_label} ({result['confidence']}) - {result['reason']}")
                 if result["keep"]:
-                    expanded.add(neighbor)
-
-    added = len(expanded) - len(confirmed)
-    if added > 0:
-        log(f"   ✓ Added {added} neighbor page(s)")
+                    confirmed_set.add(n)
+                    added_count += 1
+        if added_count > 0:
+            log(f"   ✓ Added {added_count} neighbor page(s)")
+        else:
+            log("   (no neighbors added)")
     else:
-        log("   (no neighbors added)")
+        log("   (no neighbors to check)")
 
-    return sorted(expanded), classifications
+    return sorted(confirmed_set), classifications
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -634,6 +711,27 @@ class CostTracker:
 # ═══════════════════════════════════════════════════════════════════════════════
 # SECTION 5: PDF CONTENT EXTRACTION (for Stage 3)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def derive_company_name_from_pdf(pdf_path: str) -> str:
+    """
+    Build a company-name fallback from the PDF filename.
+
+    Examples:
+        eli_illy.pdf          -> "eli illy"
+        phizer_page12-23.pdf  -> "phizer"
+        Tesla_AR_2023.pdf     -> "Tesla AR 2023"
+    """
+    stem = Path(pdf_path).stem
+    # Strip trailing page-range markers: _page12-23, -pages-1-5, _p12, etc.
+    stripped = re.sub(
+        r'[_\-\s]+p(?:age)?s?[_\-\s]*\d+(?:[\-_]\d+)?.*$',
+        '',
+        stem,
+        flags=re.IGNORECASE,
+    )
+    name = re.sub(r'\s+', ' ', stripped.replace('_', ' ')).strip()
+    return name or stem
+
 
 def extract_text_from_pages(pdf_path: str, pages: list[int]) -> dict:
     result = {}
@@ -749,6 +847,9 @@ Examples:
                         help="Disable disk cache + Anthropic prompt caching (force fresh API calls)")
     parser.add_argument("--clear-cache", action="store_true",
                         help="Delete all cached entries before running")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Parallel workers for Stage 1 keyword scan & Stage 2 LLM classifier "
+                             "(default: 8; lower this if Together AI rate-limits you)")
 
     args = parser.parse_args()
     global VERBOSE
@@ -819,6 +920,7 @@ Examples:
             skip_llm=not use_llm_filter,
             debug=debug_scores,
             cost_tracker=cost_tracker,
+            workers=max(1, args.workers),
         )
         log(f"\n🎯 Final: {len(target_pages)} page(s) {target_pages}")
 
@@ -909,6 +1011,10 @@ Examples:
 
     # Final quality validation — adds _validation_summary with completeness metrics
     final = validate_final_output(final)
+
+    # Company name comes from the PDF filename (LLM extraction is unreliable for this).
+    # Strips page-range suffixes and converts underscores to spaces.
+    final["company_name"] = derive_company_name_from_pdf(pdf_path)
 
     final["_meta"] = {
         "source_pdf": os.path.basename(pdf_path),
