@@ -5,6 +5,8 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    host: true,
+    allowedHosts: ['.loca.lt', '.localtunnel.me', '.trycloudflare.com'],
     proxy: {
       '/api': {
         target: 'http://localhost:8000',
@@ -14,6 +16,6 @@ export default defineConfig({
   },
   preview: {
     host: true,
-    allowedHosts: ['.onrender.com'],
+    allowedHosts: ['.onrender.com', '.up.railway.app'],
   },
 })
